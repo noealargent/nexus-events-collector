@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.pem
+*.key
+firebase-sa.json
+**/firebase-sa.json
+data/nexus-store.json
+*.local.json
+out/
+artifacts/
+.DS_Store

@@ -1,0 +1,225 @@
+name: Nexus nightly events collection
+
+# Public repo so GitHub Actions minutes are free. Each shard visits a slice of
+# every listed church website; shard 0 also visits every organisation site.
+# Past events are archived, then a final job updates the private app repo
+# (live branch cursor/nexus-firebase-static-demo-23e0) and can deploy Hosting.
+# Secrets stay in this repo's Actions secrets, never in the source tree.
+# Respects robots.txt, TDM reservations, and data/optout.json.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-events
+  cancel-in-progress: false
+
+env:
+  LIVE_BRANCH: cursor/nexus-firebase-static-demo-23e0
+  DATA_BRANCH: cursor/nexus-events-nightly-data
+  APP_REPO: noealargent/studiopainperdu-app
+  TZ: America/Denver
+  NEXUS_EVENTS_ALLOW_HTTP: "1"
+  SHARD_COUNT: "16"
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Collect this shard (all assigned church sites; organisations on shard 0)
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ORG_FLAG=--no-always-orgs
+          if [ "${{ matrix.shard }}" = "0" ]; then
+            ORG_FLAG=--always-orgs
+          fi
+          for CC in FR US; do
+            python3 scripts/events/import_events.py \
+              --countries "$CC" \
+              --shards data/church-sites.json \
+              --optout data/optout.json \
+              --organisations scripts/events/organisation-sites.json \
+              --out "out/shard-${{ matrix.shard }}-${CC}.json" \
+              --log "out/shard-${{ matrix.shard }}-log-${CC}.json" \
+              --limit 0 \
+              --seconds 0 \
+              --no-signal-days 0 \
+              --hot-cap 0 \
+              --no-prioritize-events \
+              --matrix-shard "${{ matrix.shard }}" \
+              --matrix-shards "${SHARD_COUNT}" \
+              --workers 10 \
+              "$ORG_FLAG"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: collect
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      pr_url: ${{ steps.pr.outputs.url }}
+      pr_number: ${{ steps.pr.outputs.number }}
+      merged: ${{ steps.merge.outputs.merged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: collector
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r collector/requirements.txt
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+          merge-multiple: true
+      - name: Stop if the private-repo token is missing
+        id: token
+        env:
+          NEXUS_APP_REPO_TOKEN: ${{ secrets.NEXUS_APP_REPO_TOKEN }}
+        run: |
+          if [ -z "${NEXUS_APP_REPO_TOKEN}" ]; then
+            echo "NEXUS_APP_REPO_TOKEN is not set. Shard artifacts are kept for 7 days."
+            echo "Add that secret (and FIREBASE_SERVICE_ACCOUNT_NEXUS_APP_9A9D0 to deploy) as described in the README."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.LIVE_BRANCH }}
+          token: ${{ secrets.NEXUS_APP_REPO_TOKEN }}
+          fetch-depth: 0
+          path: app
+      - name: Merge shards, archive past events, write last-run summary
+        if: steps.token.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          python3 collector/scripts/events/merge_shards.py \
+            --shards-dir shards \
+            --app-root app \
+            --summary app/docs/events-archive/last-run.json
+      - name: Open or update the review PR on the private live branch
+        if: steps.token.outputs.present == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.NEXUS_APP_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd app
+          git config user.name "Nexus Events Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/events/index.json public/events/us.json public/events/manual-events.json \
+            docs/events-archive/expired.json docs/events-archive/last-run.json docs/events-archive/coverage.json
+          if git diff --cached --quiet; then
+            echo "No event file changes."
+            echo "url=" >> "$GITHUB_OUTPUT"
+            echo "number=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git stash push --staged -m "nightly events"
+          git fetch origin "$LIVE_BRANCH"
+          git checkout -B "$DATA_BRANCH" "origin/$LIVE_BRANCH"
+          git stash pop
+          git add public/events/index.json public/events/us.json public/events/manual-events.json \
+            docs/events-archive/expired.json docs/events-archive/last-run.json docs/events-archive/coverage.json
+          git commit -m "Refresh public events (nightly archive and full collect)."
+          git push --force-with-lease origin "$DATA_BRANCH"
+          existing=$(gh pr list --repo "$APP_REPO" --base "$LIVE_BRANCH" --head "$DATA_BRANCH" --state open --json url,number --jq '.[0] // empty')
+          if [ -n "$existing" ]; then
+            url=$(echo "$existing" | jq -r .url)
+            number=$(echo "$existing" | jq -r .number)
+            echo "url=$url" >> "$GITHUB_OUTPUT"
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+            echo "Updated $url"
+          else
+            url=$(gh pr create --repo "$APP_REPO" --base "$LIVE_BRANCH" --head "$DATA_BRANCH" \
+              --title "Refresh public events (review, then merge into live)" \
+              --body "Automated nightly refresh from the public collector \`noealargent/nexus-events-collector\`. Every listed church site and every organisation site was queued across 16 parallel shards. Past events (last day before today, America/Denver) were archived to \`docs/events-archive/expired.json\`. Opt-outs in the collector's \`data/optout.json\` and robots.txt / TDM reservations were honoured.
+
+          This PR targets the live branch, not \`main\`. When auto-publish is on in the collector repo, the next job merges this PR into live and deploys Hosting from the live tip.")
+            number=$(gh pr list --repo "$APP_REPO" --base "$LIVE_BRANCH" --head "$DATA_BRANCH" --state open --json number --jq '.[0].number')
+            echo "url=$url" >> "$GITHUB_OUTPUT"
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+            echo "Opened $url"
+          fi
+      - name: Merge the data PR into the live branch
+        if: >-
+          steps.token.outputs.present == 'true'
+          && vars.NEXUS_EVENTS_AUTO_PUBLISH == 'true'
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.NEXUS_APP_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          number="${{ steps.pr.outputs.number }}"
+          if [ -z "$number" ]; then
+            number=$(gh pr list --repo "$APP_REPO" --base "$LIVE_BRANCH" --head "$DATA_BRANCH" --state open --json number --jq '.[0].number // empty')
+          fi
+          if [ -z "$number" ]; then
+            echo "No open data PR; nothing to merge or deploy."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh pr merge "$number" --repo "$APP_REPO" --merge --delete-branch=false \
+            --subject "Merge pull request #${number} from ${DATA_BRANCH}"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "Merged #$number into $LIVE_BRANCH"
+      - uses: actions/checkout@v4
+        if: steps.merge.outputs.merged == 'true'
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.LIVE_BRANCH }}
+          token: ${{ secrets.NEXUS_APP_REPO_TOKEN }}
+          fetch-depth: 1
+          path: deploy
+      - uses: actions/setup-node@v4
+        if: steps.merge.outputs.merged == 'true'
+        with:
+          node-version: "20"
+      - name: Build and deploy live hosting from the live branch
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          FIREBASE_SERVICE_ACCOUNT_NEXUS_APP_9A9D0: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_NEXUS_APP_9A9D0 }}
+          VITE_NEXUS_BACKEND: firebase
+          VITE_NEXUS_MAIL_ENDPOINT: https://nexus-mail.nexuschurches.workers.dev
+        working-directory: deploy
+        run: |
+          set -euo pipefail
+          if [ -z "${FIREBASE_SERVICE_ACCOUNT_NEXUS_APP_9A9D0}" ]; then
+            echo "FIREBASE_SERVICE_ACCOUNT_NEXUS_APP_9A9D0 is empty; refusing to deploy."
+            exit 1
+          fi
+          npm ci --ignore-scripts
+          npm run build
+          umask 077
+          key="$RUNNER_TEMP/firebase-sa.json"
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_NEXUS_APP_9A9D0" > "$key"
+          export GOOGLE_APPLICATION_CREDENTIALS="$key"
+          npx --yes firebase-tools deploy --only hosting:app --project nexus-app-9a9d0 --non-interactive
+          rm -f "$key"
